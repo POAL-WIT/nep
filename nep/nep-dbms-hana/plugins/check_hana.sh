@@ -15,8 +15,12 @@
 ####    21.02.2023    1.10  function "last_backup" added        #
 ####    18.12.2023    1.20  function "failed_data_backup" added #
 ####    04/11/2024    1.30  function "used_space" added POAL    #
-####	  11/11/2024    1.40  function "missing index" added POAL #
+####	11/11/2024    1.40  function "missing index" added POAL #
 ####    24/04/2026    1.50  fix remove temp file in crash case  #
+####    11/08/2026    1.51  fix green result in case of failed  #
+####                        add ERRFILE instead TMPFILE         #
+####    08/09/2026    1.60  function "disk_usage" added         #
+####                        (filesystem usage from M_DISKS)     #
 ####                                                            #
 #################################################################
 ####
@@ -48,10 +52,11 @@ REVISION=`echo '$Revision: 1.00 $' | sed -e 's/[^0-9.]//g'`
 #
 INFILE="${TMP_DIR}/infile_`basename $0`_${HANA_SID}.$$"
 TMPFILE="${TMP_DIR}/tmpfile_`basename $0`_${HANA_SID}.$$"
+ERRFILE="${TMP_DIR}/errfile_`basename $0`_${HANA_SID}.$$"
 #
 
 cleanup() {
-    rm -f "$INFILE" "$TMPFILE"
+    rm -f "$INFILE" "$TMPFILE" "$ERRFILE"
 }
 trap cleanup EXIT INT TERM
 
@@ -68,6 +73,7 @@ print_usage() {
   echo "  $PROGNAME --function memory_usage --sid <SID> --host <HOST> --port <PORT> --user <USER> --pass <PASSWORD> --crit <memory free % CRITICAL> --warn <memory free % WARNING>"
   echo "  $PROGNAME --function replication_status --sid <SID> --host <HOST> --port <PORT> --user <USER> --pass <PASSWORD>"
   echo "  $PROGNAME --function used_space --sid <SID> --host <HOST> --port <PORT> --user <USER> --pass <PASSWORD>"
+  echo "  $PROGNAME --function disk_usage --sid <SID> --host <HOST> --port <PORT> --user <USER> --pass <PASSWORD> [--usage <DATA,LOG,TRACE,BACKUP>] [--warn <pct>] [--crit <pct>] [--warnlog <pct>] [--critlog <pct>]"
   echo "  $PROGNAME --function missing_index --sid <SID> --host <HOST> --port <PORT> --user <USER> --pass <PASSWORD>"
   echo "  $PROGNAME --help"
   echo "  $PROGNAME --version"
@@ -81,6 +87,15 @@ print_help() {
   echo ""
   echo "--function connection_time"
   echo "   Attempt a dummy login and alert if login is not possible"
+  echo "--function disk_usage"
+  echo "   Filesystem usage of the HANA volumes (M_DISKS), one line per host/usage-type."
+  echo "   --usage    comma separated list of usage types (default: DATA,LOG)"
+  echo "   --warn     warning threshold in percent, non-LOG volumes (default: 85)"
+  echo "   --crit     critical threshold in percent, non-LOG volumes (default: 95)"
+  echo "   --warnlog  warning threshold in percent, LOG volumes (default: 80)"
+  echo "   --critlog  critical threshold in percent, LOG volumes (default: 90)"
+  echo "   NOTE: this is filesystem fill level, which is NOT the same as --function used_space,"
+  echo "         that one reports the fill degree inside the data volume file."
   echo "--help"
   echo "   Print this help screen"
   echo "--version"
@@ -107,6 +122,9 @@ while [[ "$#" -gt 0 ]]; do
     --pass)      HANA_PASS="$2";     shift;;
     --warn)      HANA_WARN=$2;       shift;;
     --crit)      HANA_CRIT=$2;       shift;;
+    --usage)     HANA_USAGE="$2";    shift;;
+    --warnlog)   HANA_WARN_LOG=$2;   shift;;
+    --critlog)   HANA_CRIT_LOG=$2;   shift;;
     *)          echo "UNKNOWN: Parameter not valid: $1"; exit 3;;
   esac
   shift
@@ -133,9 +151,12 @@ get_connection_time ()
   cat >>$INFILE <<@EOF
 select * from M_DATABASE;
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" 2>"$ERRFILE"
   RET=$?
-  rm -f $INFILE $TMPFILE
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
+  rm -f $INFILE
   return $RET
 }
 
@@ -147,8 +168,11 @@ check_log_backup ()
   cat >>$INFILE <<@EOF
 select backup_id, sys_start_time, state_name from m_backup_catalog where entry_type_name='log backup' and sys_end_time >= add_seconds (current_timestamp, -${HANA_LOOKBACK}*60) and not state_name in ('successful', 'running');
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" 2>"$ERRFILE"
   RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
   rm -f $INFILE
   return $RET
 }
@@ -161,8 +185,11 @@ check_failed_data_backup ()
   cat >>$INFILE <<@EOF
 select backup_id, sys_start_time, state_name from m_backup_catalog where entry_type_name='data backup' and sys_end_time >= add_seconds (current_timestamp, -${HANA_LOOKBACK}*60*60) and not state_name in ('successful', 'running');
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" 2>"$ERRFILE"
   RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
   rm -f $INFILE
   return $RET
 }
@@ -375,8 +402,11 @@ ORDER BY
   SERVICE_NAME
 WITH HINT (NO_JOIN_REMOVAL)
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" 2>"$ERRFILE"
   RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
   rm -f $INFILE
   return $RET
 }
@@ -389,8 +419,11 @@ check_memory_used ()
   cat >>$INFILE <<@EOF
 select value from m_system_overview where section='Memory';
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" 2>"$ERRFILE"
   RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
   rm -f $INFILE
   return $RET
 }
@@ -403,8 +436,11 @@ check_replication_status ()
   cat >>$INFILE <<@EOF
 SELECT host, LPAD(port, 5) port, site_name, secondary_site_name, secondary_host, LPAD(secondary_port, 5) secondary_port, replication_mode, MAP(secondary_active_status, 'YES', 1,0) secondary_active_status, MAP(UPPER(replication_status),'ACTIVE',0,'ERROR', 4, 'SYNCING',2, 'INITIALIZING',1,'UNKNOWN', 3, 99) replication_status, TO_DECIMAL(SECONDS_BETWEEN(SHIPPED_LOG_POSITION_TIME, LAST_LOG_POSITION_TIME), 10, 2) ship_delay_s, TO_DECIMAL((LAST_LOG_POSITION - SHIPPED_LOG_POSITION) * 64 / 1024 / 1024, 10, 2) async_buff_used_mb, secondary_reconnect_count, secondary_failover_count FROM sys.m_service_replication;
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE -F ' ' -a
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" -F ' ' -a 2>"$ERRFILE"
   RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
   rm -f $INFILE
   return $RET
 }
@@ -461,8 +497,63 @@ ORDER BY
     MAP(BI.ORDER_BY, 'HOST', V.HOST || V.PORT),
     MAP(BI.ORDER_BY, 'ALLOC', V.TOTAL_ALLOC_GB, 'USED', V.TOTAL_USED_GB) DESC
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE -F ' ' -a
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" -F ' ' -a 2>"$ERRFILE"
   RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
+  rm -f $INFILE
+  return $RET
+}
+
+#
+# check_disk_usage
+#
+# Filesystem fill level of the HANA volumes, taken from M_DISKS.
+# TOTAL_SIZE is the size of the underlying filesystem, USED_SIZE is the space
+# occupied there by HANA files of the given USAGE_TYPE. Rows are grouped by
+# DEVICE_ID so that several volumes on the same filesystem are not counted twice.
+#
+check_disk_usage ()
+{
+  # default usage types, sanitized to uppercase letters and commas only
+  [ -z "$HANA_USAGE" ] && HANA_USAGE="DATA,LOG"
+  usage_clean=$(echo "$HANA_USAGE" | tr 'a-z' 'A-Z' | tr -cd 'A-Z,')
+  usage_list=$(echo "$usage_clean" | sed -e "s/,/','/g" -e "s/^/'/" -e "s/\$/'/")
+
+  cat >>$INFILE <<@EOF
+SELECT
+    HOST,
+    USAGE_TYPE,
+    PATH,
+    TO_DECIMAL(TOTAL_GB, 10, 2) TOTAL_GB,
+    TO_DECIMAL(USED_GB, 10, 2) USED_GB,
+    TO_DECIMAL(CASE WHEN TOTAL_GB = 0 THEN 0 ELSE USED_GB / TOTAL_GB * 100 END, 10, 2) PCT_USED
+FROM
+( SELECT
+    HOST,
+    USAGE_TYPE,
+    MIN(PATH) PATH,
+    MAX(TOTAL_SIZE) / 1024 / 1024 / 1024 TOTAL_GB,
+    SUM(USED_SIZE) / 1024 / 1024 / 1024 USED_GB
+  FROM
+    M_DISKS
+  WHERE
+    USAGE_TYPE IN (${usage_list})
+  GROUP BY
+    HOST,
+    USAGE_TYPE,
+    DEVICE_ID
+)
+ORDER BY
+    HOST,
+    USAGE_TYPE
+@EOF
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" -F ';' -a 2>"$ERRFILE"
+  RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
   rm -f $INFILE
   return $RET
 }
@@ -587,8 +678,11 @@ GROUP BY
 ORDER BY
   SUM(C.COUNT) DESC;
 @EOF
-  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I $INFILE -o $TMPFILE -F ' ' -a
+  ${HDBSQL} -n ${HANA_HOST}:${HANA_PORT} -u ${HANA_USER} -p ${HANA_PASS} -I "$INFILE" -o "$TMPFILE" -F ' ' -a 2>"$ERRFILE"
   RET=$?
+  if grep -qE '^\*[[:space:]]*-?[0-9]+:' "$ERRFILE" "$TMPFILE" 2>/dev/null; then
+      RET=1
+  fi
   rm -f $INFILE
   return $RET
 }
@@ -633,7 +727,7 @@ connection_time)
         [ $ret_state -eq $STATE_OK ]       && result_string="OK - $result_string"
         PERF_OUT="|'connection-time'=$conn_time;$HANA_WARN;$HANA_CRIT;0;0"
     else
-        ret_state = $STATE_CRITICAL
+        ret_state=$STATE_CRITICAL
         result_string="sql-statement failed"
     fi
     echo "${result_string}${PERF_OUT}"
@@ -656,18 +750,18 @@ last_backup)
             runtime_int=$(echo $runtime | cut -d'.' -f 1)
             [ -z $HANA_WARN ] && HANA_WARN=120
             [ -z $HANA_CRIT ] && HANA_CRIT=240
+            ret_state=$STATE_OK
             [ $runtime_int -ge $HANA_WARN ] && ret_state=$STATE_WARNING
             [ $runtime_int -ge $HANA_CRIT ] && ret_state=$STATE_CRITICAL
             result_string="Last successful data backup of the past $HANA_LOOKBACK day(s) startet $(echo $last_backup | cut -d',' -f 14 | tr -d '[" ]') days ago (runtime: ${runtime}m)"
             PERF_OUT="|'runtime'=$runtime;$HANA_WARN;$HANA_CRIT;0;0"
-            ret_state=$STATE_OK
         fi
         [ $ret_state -eq $STATE_CRITICAL ] && result_string="CRITICAL - $result_string"
         [ $ret_state -eq $STATE_WARNING ]  && result_string="WARNING - $result_string"
         [ $ret_state -eq $STATE_OK ]       && result_string="OK - $result_string"
     else
-        ret_state = $STATE_CRITICAL
-        result_string="sql-statement failed"
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
     fi
     rm -f $TMPFILE
     echo "${result_string}${PERF_OUT}"
@@ -691,8 +785,8 @@ failed_log_backups)
         [ $num_errors -gt 0 ] && cat $TMPFILE |grep -v -i backup_id
         PERF_OUT="|'log_backups_failed'=$num_errors;$HANA_WARN;$HANA_CRIT;0;0"
     else
-        ret_state = $STATE_CRITICAL
-        result_string="sql-statement failed"
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
     fi
     rm -f $TMPFILE
     echo "${result_string}${PERF_OUT}"
@@ -716,8 +810,8 @@ failed_data_backups)
         [ $num_errors -gt 0 ] && cat $TMPFILE |grep -v -i backup_id
         PERF_OUT="|'data_backups_failed'=$num_errors;$HANA_WARN;$HANA_CRIT;0;0"
     else
-        ret_state = $STATE_CRITICAL
-        result_string="sql-statement failed"
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
     fi
     #rm -f $TMPFILE
     echo "${result_string}${PERF_OUT}"
@@ -748,8 +842,8 @@ memory_usage)
         [ $ret_state -eq $STATE_OK ]       && result_string="OK - $result_string"
         PERF_OUT="|'memory_usage'=$mem_used$mem_unit;$warn;$crit;0;$mem_physical"
     else
-        ret_state = $STATE_CRITICAL
-        result_string="sql-statement failed"
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
     fi
     rm -f $TMPFILE
     echo "${result_string}${PERF_OUT}"
@@ -800,8 +894,8 @@ replication_status)
         fi
         PERF_OUT="|$perf_string"
     else
-        ret_state = $STATE_CRITICAL
-        result_string="sql-statement failed"
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
     fi
     rm -f $TMPFILE
     echo "${result_string}${PERF_OUT}"
@@ -845,11 +939,82 @@ used_space)
         fi
         PERF_OUT="|$perf_string"
     else
-        ret_state = $STATE_CRITICAL
-        result_string="sql-statement failed"
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
     fi
     rm -f $TMPFILE
     echo "${result_string}${PERF_OUT}"
+    exit $ret_state
+    ;;
+
+
+disk_usage)
+    check_disk_usage
+    sqlret=$?
+    if [ $sqlret -eq 0 ]; then
+        num_rows=$(grep -c ';' $TMPFILE)
+        # thresholds in percent of filesystem size
+        [ -z "$HANA_WARN" ]     && HANA_WARN=85
+        [ -z "$HANA_CRIT" ]     && HANA_CRIT=95
+        [ -z "$HANA_WARN_LOG" ] && HANA_WARN_LOG=80
+        [ -z "$HANA_CRIT_LOG" ] && HANA_CRIT_LOG=90
+        ret_state=$STATE_OK
+        err_string=""
+        detail_string=""
+        perf_string=""
+        while read -r line
+        do
+            # example-output:   "sapdbp01";"LOG";"/hana/log/H0P/mnt00001";512.00;181.44;35.44
+            clean=$(echo "$line" | tr -d '"')
+            IFS=';' read -r DISK_HOST USAGE_TYPE DISK_PATH TOTAL_GB USED_GB PCT_USED <<< "$clean"
+            [ -z "$USAGE_TYPE" ] && continue
+
+            # LOG volumes get their own, tighter thresholds
+            if [ "$USAGE_TYPE" = "LOG" ]; then
+                warn_val=$HANA_WARN_LOG
+                crit_val=$HANA_CRIT_LOG
+            else
+                warn_val=$HANA_WARN
+                crit_val=$HANA_CRIT
+            fi
+
+            [ "$detail_string" = "" ] && detail_string="HOST USAGE_TYPE PATH TOTAL_GB USED_GB PCT_USED"
+            detail_string="${detail_string}\n${DISK_HOST} ${USAGE_TYPE} ${DISK_PATH} ${TOTAL_GB} ${USED_GB} ${PCT_USED}"
+
+            if [ $(echo "$PCT_USED >= $warn_val" | bc -l) -ne 0 ]; then
+                [ $ret_state -ne $STATE_CRITICAL ] && ret_state=$STATE_WARNING
+                err_string="${err_string}, ${DISK_HOST} ${USAGE_TYPE} at ${PCT_USED}%"
+                if [ $(echo "$PCT_USED >= $crit_val" | bc -l) -ne 0 ]; then
+                    ret_state=$STATE_CRITICAL
+                fi
+            fi
+
+            # sanitize label: hostnames contain dots, paths contain slashes
+            label=$(printf '%s' "${DISK_HOST}_${USAGE_TYPE}" | tr -c 'A-Za-z0-9_-' '_')
+            [ "$perf_string" != "" ] && perf_string="${perf_string} "
+            perf_string="${perf_string}'${label}_pct'=${PCT_USED}%;${warn_val};${crit_val};0;100"
+            perf_string="${perf_string} '${label}_used'=${USED_GB}GB;;;0;${TOTAL_GB}"
+        done <$TMPFILE
+
+        if [ $num_rows -eq 0 ]; then
+            ret_state=$STATE_UNKNOWN
+            result_string="UNKNOWN - no volume found for usage types '${HANA_USAGE:-DATA,LOG}' on database $HANA_SID"
+            PERF_OUT=""
+        else
+            err_string="Filesystem usage $HANA_SID${err_string}"
+            [ $ret_state -eq $STATE_CRITICAL ] && result_string="CRITICAL - $err_string"
+            [ $ret_state -eq $STATE_WARNING ]  && result_string="WARNING - $err_string"
+            [ $ret_state -eq $STATE_OK ]       && result_string="OK - $err_string, all volumes below threshold"
+            # perfdata belong on the first line, detail lines follow afterwards
+            PERF_OUT="|${perf_string}\n${detail_string}"
+        fi
+    else
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
+        PERF_OUT=""
+    fi
+    rm -f $TMPFILE
+    echo -e "${result_string}${PERF_OUT}"
     exit $ret_state
     ;;
 
@@ -873,10 +1038,10 @@ missing_index)
             [ "$result_string" = "" ] && result_string="SCHEMA_NAME TABLE_NAME INDEX_NAME COLUMN_NAME COMP_TYPE NUM_ROWS IMPLEMENTATION_COMMAND\n"
             result_string="${result_string}${line}\n"
 
-			if [ $num_rows > $HANA_WARN ]; then
+			if [ $num_rows -gt $HANA_WARN ]; then
                 ret_state=$STATE_WARNING
                 err_string="${err_string}, Index name: ${HOST}:${PORT} ${INDEX_NAME}"
-                [ $num_rows > $HANA_CRIT ] && ret_state=$STATE_CRITICAL
+                [ $num_rows -gt $HANA_CRIT ] && ret_state=$STATE_CRITICAL
             fi
             [ "$perf_string" != "" ] && perf_string="${perf_string} "
             perf_string="${perf_string}'schema-${SCHEMA_NAME},table-{TABLE_NAME}'=${INDEX_NAME}s;${HANA_WARN};${HANA_CRIT};0;0"
@@ -890,8 +1055,8 @@ missing_index)
         fi
         PERF_OUT="|$perf_string"
     else
-        ret_state = $STATE_CRITICAL
-        result_string="sql-statement failed"
+        ret_state=$STATE_CRITICAL
+        result_string="CRITICAL - sql-statement failed: $(head -1 "$ERRFILE" | tr -d '\n')"
     fi
     rm -f $TMPFILE
     echo "${result_string}${PERF_OUT}"
