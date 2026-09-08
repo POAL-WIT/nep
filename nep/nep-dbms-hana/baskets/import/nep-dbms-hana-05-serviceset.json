@@ -57,6 +57,16 @@
                 {
                     "fields": [],
                     "imports": [
+                        "nx-st-hana-disk-usage",
+                        "nx-st-type-custom"
+                    ],
+                    "object_name": "HANA Disk Usage",
+                    "object_type": "object",
+                    "uuid": "eb54c8e1-86f6-4a51-8613-3227afa3eb64"
+                },
+                {
+                    "fields": [],
+                    "imports": [
                         "nx-st-hana-failed-data-backups"
                     ],
                     "object_name": "HANA Failed Data Backups",
